@@ -8,9 +8,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
-#if defined(GGML_USE_VULKAN)
-#  include "ggml-vulkan.h"
-#elif defined(GGML_USE_SYCL)
+#if defined(GGML_USE_SYCL)
 #  include "ggml-sycl.h"
 #elif defined(GGML_USE_KOMPUTE)
 #   include "ggml-kompute.h"
@@ -3418,8 +3416,6 @@ static int llama_get_device_count(const llama_model & model) {
 
 #if defined(GGML_USE_SYCL)
     count += ggml_backend_sycl_get_device_count();
-#elif defined(GGML_USE_VULKAN)
-    count += ggml_backend_vk_get_device_count();
 #elif defined(GGML_USE_CANN)
     count += ggml_backend_cann_get_device_count();
 #endif
@@ -3451,10 +3447,6 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_cpu(const llama_mode
     }
 #elif defined(GGML_USE_CPU_HBM)
     buft = ggml_backend_cpu_hbm_buffer_type();
-#elif defined(GGML_USE_VULKAN)
-    if (host_buffer) {
-        buft = ggml_backend_vk_host_buffer_type();
-    }
 #endif
 
     if (buft == nullptr) {
@@ -3473,9 +3465,7 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
     }
     device -= (int)model.devices.size();
 
-#if defined(GGML_USE_VULKAN)
-    buft = ggml_backend_vk_buffer_type(device);
-#elif defined(GGML_USE_SYCL)
+#if defined(GGML_USE_SYCL)
     buft = ggml_backend_sycl_buffer_type(device);
 #elif defined(GGML_USE_KOMPUTE)
     buft = ggml_backend_kompute_buffer_type(device);
@@ -3534,11 +3524,6 @@ static size_t llama_get_device_memory(const llama_model & model, int device) {
     size_t total;
     size_t free;
     ggml_backend_sycl_get_device_memory(device, &free, &total);
-    return free;
-#elif defined(GGML_USE_VULKAN)
-    size_t total;
-    size_t free;
-    ggml_backend_vk_get_device_memory(device, &free, &total);
     return free;
 #elif defined(GGML_USE_CANN)
     size_t total;
@@ -6750,9 +6735,9 @@ static void llm_load_vocab(
                     vocab.id_to_token[t.second].attr = LLAMA_TOKEN_ATTR_CONTROL;
                 }
             } else {
-                // token is control, but not marked as EOG -> print a warning
+                // token is control, but not marked as EOG -> print a debug log
                 if (vocab.id_to_token[t.second].attr & LLAMA_TOKEN_ATTR_CONTROL && vocab.special_eog_ids.count(t.second) == 0) {
-                    LLAMA_LOG_WARN("%s: control token: %6d '%s' is not marked as EOG\n",
+                    LLAMA_LOG_DEBUG("%s: control token: %6d '%s' is not marked as EOG\n",
                             __func__, t.second, t.first.c_str());
                 }
             }
@@ -16095,9 +16080,11 @@ struct llm_build_context {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
 
         cur = llm_build_norm(ctx0, cur, hparams, model.output_norm, model.output_norm_b, LLM_NORM, cb, -1);
-        cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
+        cb(cur, "result_norm", -1);
 
+        cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
         cb(cur, "result_output", -1);
+
         ggml_build_forward_expand(gf, cur);
 
         return gf;
@@ -19093,8 +19080,7 @@ bool llama_supports_mlock(void) {
 }
 
 bool llama_supports_gpu_offload(void) {
-#if defined(GGML_USE_VULKAN) || \
-    defined(GGML_USE_SYCL) || defined(GGML_USE_KOMPUTE)
+#if defined(GGML_USE_SYCL) || defined(GGML_USE_KOMPUTE)
     // Defined when llama.cpp is compiled with support for offloading model layers to GPU.
     return true;
 #else
@@ -19225,8 +19211,13 @@ struct llama_model * llama_load_model_from_file(
 
             case GGML_BACKEND_DEVICE_TYPE_GPU:
             case GGML_BACKEND_DEVICE_TYPE_GPU_FULL:
+            {
+                size_t free, total; // NOLINT
+                ggml_backend_dev_memory(dev, &free, &total);
+                LLAMA_LOG_INFO("%s: using device %s (%s) - %zu MiB free\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), free/1024/1024);
                 model->devices.push_back(dev);
                 break;
+            }
         }
     }
 
@@ -19421,32 +19412,7 @@ struct llama_context * llama_new_context_with_model(
             main_gpu -= (int)model->devices.size();
         }
 
-#if defined(GGML_USE_VULKAN)
-        if (model->split_mode == LLAMA_SPLIT_MODE_ROW) {
-            LLAMA_LOG_ERROR("%s: Row split not supported. Failed to initialize Vulkan backend\n", __func__);
-            llama_free(ctx);
-            return nullptr;
-        }
-        if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
-            ggml_backend_t backend = ggml_backend_vk_init(main_gpu);
-            if (backend == nullptr) {
-                LLAMA_LOG_ERROR("%s: failed to initialize Vulkan backend\n", __func__);
-                llama_free(ctx);
-                return nullptr;
-            }
-            ctx->backends.push_back(backend);
-        } else {
-            for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
-                ggml_backend_t backend = ggml_backend_vk_init(device);
-                if (backend == nullptr) {
-                    LLAMA_LOG_ERROR("%s: failed to initialize Vulkan%d backend\n", __func__, device);
-                    llama_free(ctx);
-                    return nullptr;
-                }
-                ctx->backends.push_back(backend);
-            }
-        }
-#elif defined(GGML_USE_SYCL)
+#if defined(GGML_USE_SYCL)
         // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_ROW, only the main GPU backend is used
         if (model->split_mode == LLAMA_SPLIT_MODE_NONE || model->split_mode == LLAMA_SPLIT_MODE_ROW) {
             ggml_backend_t backend = ggml_backend_sycl_init(main_gpu);
@@ -21498,13 +21464,6 @@ int32_t llama_token_to_piece(
                      int32_t   lstrip,
                         bool   special) {
     return llama_token_to_piece_impl(model->vocab, token, buf, length, lstrip, special);
-}
-
-bool llama_token_is_prefix(
-    const struct llama_model * model,
-                 llama_token   token0,
-                 llama_token   token1) {
-    return llama_token_is_prefix_impl(model->vocab, token0, token1);
 }
 
 int32_t llama_detokenize(
